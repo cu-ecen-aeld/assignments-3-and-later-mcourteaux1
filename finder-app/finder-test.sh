@@ -10,7 +10,7 @@ WRITESTR=AELD_IS_FUN
 WRITEDIR=/tmp/aeld-data
 
 # ✅ Corrected the path to `username.txt`
-username=$(cat /home/mike/Desktop/Assignment3/finder-app/conf/assignment.txt)
+username=$(cat /home/mike/Desktop/Assignment3/finder-app/conf/username.txt)
 
 if [ $# -lt 3 ]
 then
