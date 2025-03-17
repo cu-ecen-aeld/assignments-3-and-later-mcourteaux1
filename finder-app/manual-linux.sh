@@ -87,6 +87,12 @@ make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE -j$(nproc) Image
 echo "Copying kernel image to $OUTDIR..."
 cp arch/arm/boot/Image "$OUTDIR/Image"
 
+# Check if the Image file was created successfully
+if [ ! -f "$OUTDIR/Image" ]; then
+    echo "Error: Kernel image (Image) not found!"
+    exit 1
+fi
+
 popd > /dev/null
 
 echo "Kernel build completed successfully!"
@@ -116,15 +122,19 @@ echo "Copying shared libraries..."
 # Correct library path
 SYSROOT="/usr/arm-linux-gnueabihf/lib"
 
+# Ensure the sysroot exists
+if [ ! -d "$SYSROOT" ]; then
+    echo "Error: Sysroot path $SYSROOT not found. Please ensure you have the necessary libraries installed."
+    exit 1
+fi
+
 echo "Using fixed sysroot path: $SYSROOT"
 
 # Copy required libraries
-echo "Copying shared libraries..."
 cp -v "$SYSROOT/ld-linux-armhf.so.3" "$OUTDIR/rootfs/lib/"
 cp -v "$SYSROOT/libm.so.6" "$OUTDIR/rootfs/lib/"
 cp -v "$SYSROOT/libresolv.so.2" "$OUTDIR/rootfs/lib/"
 cp -v "$SYSROOT/libc.so.6" "$OUTDIR/rootfs/lib/"
-
 
 # Create init script (init will be executed by kernel on boot)
 echo "Creating init script..."
@@ -154,7 +164,8 @@ mkdir -p "$OUTDIR/rootfs/home/"
 # List of files to copy
 FILES=("finder.sh" "finder-test.sh" "conf/username.txt" "conf/assignment.txt" "autorun-qemu.sh")
 
-for file in finder.sh finder-test.sh conf/username.txt conf/assignment.txt autorun-qemu.sh; do
+# Loop to copy files
+for file in "${FILES[@]}"; do
     SRC_PATH="$SCRIPT_DIR/$file"
     DEST_PATH="$OUTDIR/rootfs/home/$(basename "$file")"  # Remove conf/ from destination
 
@@ -165,19 +176,6 @@ for file in finder.sh finder-test.sh conf/username.txt conf/assignment.txt autor
         echo "Warning: $file not found in $SCRIPT_DIR! Skipping copy..."
     fi
 done
-
-
-# Copy finder scripts
-cp -v "finder.sh" "$OUTDIR/rootfs/home/"
-cp -v "conf/username.txt" "$OUTDIR/rootfs/home/"
-cp -v "conf/assignment.txt" "$OUTDIR/rootfs/home/"
-cp -v "finder-test.sh" "$OUTDIR/rootfs/home/"
-cp -v "autorun-qemu.sh" "$OUTDIR/rootfs/home/"
-
-# Ensure correct permissions
-chmod +x "$OUTDIR/rootfs/home/finder.sh"
-chmod +x "$OUTDIR/rootfs/home/finder-test.sh"
-chmod +x "$OUTDIR/rootfs/home/autorun-qemu.sh"
 
 echo "Recreating initramfs with updated files..."
 pushd "$OUTDIR/rootfs" > /dev/null
