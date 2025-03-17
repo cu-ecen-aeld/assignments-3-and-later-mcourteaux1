@@ -10,7 +10,7 @@ WRITESTR=AELD_IS_FUN
 WRITEDIR=/tmp/aeld-data
 
 # ✅ Corrected the path to `username.txt`
-username=$(cat /home/username.txt)
+username=$(cat /home/mike/Desktop/Assignment3/finder-app/conf/assignment.txt)
 
 if [ $# -lt 3 ]
 then
@@ -34,7 +34,7 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 rm -rf "${WRITEDIR}"
 
 # ✅ Corrected the path to `assignment.txt`
-assignment=$(cat /home/assignment.txt)
+assignment=$(cat /home/mike/Desktop/Assignment3/finder-app/conf/assignment.txt)
 
 if [ "$assignment" != "assignment1" ]
 then
@@ -51,11 +51,11 @@ fi
 for i in $(seq 1 "$NUMFILES")
 do
     # ✅ Ensure `writer.sh` runs with `/bin/sh`
-    /bin/sh /home/writer.sh "$WRITEDIR/${username}$i.txt" "$WRITESTR"
+    /home/mike/Desktop/Assignment3/finder-app/writer.sh "$WRITEDIR/${username}$i.txt" "$WRITESTR"
 done
 
 # ✅ Ensure `finder.sh` runs with `/bin/sh`
-OUTPUTSTRING=$(/bin/sh /home/finder.sh "$WRITEDIR" "$WRITESTR")
+OUTPUTSTRING=$(/home/mike/Desktop/Assignment3/finder-app/finder.sh "$WRITEDIR" "$WRITESTR")
 
 # remove temporary directories
 rm -rf /tmp/aeld-data
