@@ -8,7 +8,9 @@ set -u
 NUMFILES=10
 WRITESTR=AELD_IS_FUN
 WRITEDIR=/tmp/aeld-data
-username=$(cat conf/username.txt)
+
+# ✅ Corrected the path to `username.txt`
+username=$(cat /home/username.txt)
 
 if [ $# -lt 3 ]
 then
@@ -31,10 +33,10 @@ echo "Writing ${NUMFILES} files containing string ${WRITESTR} to ${WRITEDIR}"
 
 rm -rf "${WRITEDIR}"
 
-# create $WRITEDIR if not assignment1
-assignment=`cat ../conf/assignment.txt`
+# ✅ Corrected the path to `assignment.txt`
+assignment=$(cat /home/assignment.txt)
 
-if [ $assignment != 'assignment1' ]
+if [ "$assignment" != "assignment1" ]
 then
     mkdir -p "$WRITEDIR"
 
@@ -46,23 +48,25 @@ then
     fi
 fi
 
-for i in $( seq 1 $NUMFILES)
+for i in $(seq 1 "$NUMFILES")
 do
-    ./writer.sh "$WRITEDIR/${username}$i.txt" "$WRITESTR"
+    # ✅ Ensure `writer.sh` runs with `/bin/sh`
+    /bin/sh /home/writer.sh "$WRITEDIR/${username}$i.txt" "$WRITESTR"
 done
 
-OUTPUTSTRING=$(./finder.sh "$WRITEDIR" "$WRITESTR")
+# ✅ Ensure `finder.sh` runs with `/bin/sh`
+OUTPUTSTRING=$(/bin/sh /home/finder.sh "$WRITEDIR" "$WRITESTR")
 
 # remove temporary directories
 rm -rf /tmp/aeld-data
 
 set +e
-echo ${OUTPUTSTRING} | grep "${MATCHSTR}"
+echo "${OUTPUTSTRING}" | grep "${MATCHSTR}"
 if [ $? -eq 0 ]; then
     echo "success"
     exit 0
 else
-    echo "failed: expected  ${MATCHSTR} in ${OUTPUTSTRING} but instead found"
+    echo "failed: expected ${MATCHSTR} in ${OUTPUTSTRING} but instead found"
     exit 1
 fi
 
