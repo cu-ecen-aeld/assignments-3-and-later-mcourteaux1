@@ -70,3 +70,5 @@ else
     exit 1
 fi
 
+echo "CONF_FILE is set to: $CONF_FILE"
+
