@@ -84,18 +84,24 @@ make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE defconfig
 echo "Building the kernel..."
 make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE -j$(nproc) Image
 
-echo "Copying kernel image to $OUTDIR..."
-cp arch/arm/boot/Image "$OUTDIR/Image"
-
-# Check if the Image file was created successfully
-if [ ! -f "$OUTDIR/Image" ]; then
-    echo "Error: Kernel image (Image) not found!"
+# Check if the kernel image exists after build
+if [ ! -f "$OUTDIR/linux/arch/arm/boot/Image" ]; then
+    echo "Error: Kernel image not found at arch/arm/boot/Image"
     exit 1
 fi
 
-popd > /dev/null
+echo "Kernel image found. Copying kernel image to $OUTDIR..."
+cp "$OUTDIR/linux/arch/arm/boot/Image" "$OUTDIR/Image"
 
-echo "Kernel build completed successfully!"
+# Verify that the image was copied correctly
+if [ ! -f "$OUTDIR/Image" ]; then
+    echo "Error: Failed to copy kernel image to $OUTDIR"
+    exit 1
+fi
+
+echo "Kernel build and copy completed successfully!"
+
+popd > /dev/null
 
 ### STEP 3: Creating Root Filesystem (`rootfs`) ###
 echo "Setting up root filesystem in $OUTDIR/rootfs"
@@ -122,15 +128,10 @@ echo "Copying shared libraries..."
 # Correct library path
 SYSROOT="/usr/arm-linux-gnueabihf/lib"
 
-# Ensure the sysroot exists
-if [ ! -d "$SYSROOT" ]; then
-    echo "Error: Sysroot path $SYSROOT not found. Please ensure you have the necessary libraries installed."
-    exit 1
-fi
-
 echo "Using fixed sysroot path: $SYSROOT"
 
 # Copy required libraries
+echo "Copying shared libraries..."
 cp -v "$SYSROOT/ld-linux-armhf.so.3" "$OUTDIR/rootfs/lib/"
 cp -v "$SYSROOT/libm.so.6" "$OUTDIR/rootfs/lib/"
 cp -v "$SYSROOT/libresolv.so.2" "$OUTDIR/rootfs/lib/"
@@ -164,8 +165,7 @@ mkdir -p "$OUTDIR/rootfs/home/"
 # List of files to copy
 FILES=("finder.sh" "finder-test.sh" "conf/username.txt" "conf/assignment.txt" "autorun-qemu.sh")
 
-# Loop to copy files
-for file in "${FILES[@]}"; do
+for file in finder.sh finder-test.sh conf/username.txt conf/assignment.txt autorun-qemu.sh; do
     SRC_PATH="$SCRIPT_DIR/$file"
     DEST_PATH="$OUTDIR/rootfs/home/$(basename "$file")"  # Remove conf/ from destination
 
@@ -176,6 +176,11 @@ for file in "${FILES[@]}"; do
         echo "Warning: $file not found in $SCRIPT_DIR! Skipping copy..."
     fi
 done
+
+# Ensure correct permissions
+chmod +x "$OUTDIR/rootfs/home/finder.sh"
+chmod +x "$OUTDIR/rootfs/home/finder-test.sh"
+chmod +x "$OUTDIR/rootfs/home/autorun-qemu.sh"
 
 echo "Recreating initramfs with updated files..."
 pushd "$OUTDIR/rootfs" > /dev/null
