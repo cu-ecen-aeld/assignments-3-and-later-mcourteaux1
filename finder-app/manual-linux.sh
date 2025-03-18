@@ -3,7 +3,7 @@
 # Ensure the cross-compiler and necessary dependencies are installed
 echo "Installing cross-compiler and dependencies..."
 sudo apt-get update
-sudo apt-get install -y gcc-arm-linux-gnueabihf qemu qemu-system-arm
+sudo apt-get install -y gcc-arm-linux-gnueabihf qemu qemu-system-arm git
 
 # Set the CROSS_COMPILE environment variable
 export CROSS_COMPILE=arm-linux-gnueabihf-
@@ -11,6 +11,12 @@ export CROSS_COMPILE=arm-linux-gnueabihf-
 # Ensure the repository is up-to-date and submodules are initialized
 echo "Updating submodules..."
 git submodule update --init --recursive
+
+# Check if the directory exists
+if [ ! -d "/tmp/aesd-autograder/linux" ]; then
+    echo "Directory /tmp/aesd-autograder/linux does not exist. Cloning the repository..."
+    git clone --depth 1 --branch "$KERNEL_VERSION" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git /tmp/aesd-autograder/linux
+fi
 
 # Build the kernel image
 echo "Building the kernel image..."
