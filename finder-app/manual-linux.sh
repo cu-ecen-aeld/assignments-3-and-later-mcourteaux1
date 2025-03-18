@@ -12,15 +12,25 @@ export CROSS_COMPILE=arm-linux-gnueabihf-
 echo "Updating submodules..."
 git submodule update --init --recursive
 
-# Check if the directory exists
+# Check if the directory exists, if not, clone it
 if [ ! -d "/tmp/aesd-autograder/linux" ]; then
     echo "Directory /tmp/aesd-autograder/linux does not exist. Cloning the repository..."
     git clone --depth 1 --branch "$KERNEL_VERSION" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git /tmp/aesd-autograder/linux
+else
+    echo "Directory /tmp/aesd-autograder/linux exists."
 fi
+
+# Check if the directory exists after cloning (if it wasn't there initially)
+if [ ! -d "/tmp/aesd-autograder/linux" ]; then
+    echo "Directory /tmp/aesd-autograder/linux still does not exist. Exiting..."
+    exit 1
+fi
+
+# Change to the kernel source directory
+cd /tmp/aesd-autograder/linux || { echo "Failed to change directory to /tmp/aesd-autograder/linux"; exit 1; }
 
 # Build the kernel image
 echo "Building the kernel image..."
-cd /tmp/aesd-autograder/linux
 make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE defconfig
 make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE -j$(nproc) Image
 
