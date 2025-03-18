@@ -1,26 +1,57 @@
 name: assignment-test
+
 on:
-    push:
-        tags-ignore:
-            - '*'
-        branches:
-            - '*'
+  push:
+    tags-ignore:
+      - '*'
+    branches:
+      - '*'
+
 jobs:
-    unit-test:
-        container: cuaesd/aesd-autotest:24-unit-test
-        runs-on: self-hosted
-        steps:
-          - uses: actions/checkout@v2
-          - name: Checkout submodules
-            run : git submodule update --init --recursive
-          - name: Run unit test
-            run: ./unit-test.sh
-    full-test:
-        container: cuaesd/aesd-autotest:24-assignment3
-        runs-on: self-hosted
-        steps:
-          - uses: actions/checkout@v2
-          - name: Checkout submodules
-            run : git submodule update --init --recursive
-          - name: Run full test
-            run: ./full-test.sh
+  unit-test:
+    container: cuaesd/aesd-autotest:24-unit-test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v2
+      - name: Checkout submodules
+        run: git submodule update --init --recursive
+      - name: Run unit test
+        run: ./unit-test.sh
+
+  full-test:
+    container: cuaesd/aesd-autotest:24-assignment3
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v2
+      - name: Checkout submodules
+        run: git submodule update --init --recursive
+
+      # Set up cross compiler and QEMU
+      - name: Install cross-compiler and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf qemu qemu-system-arm
+
+      # Set the cross-compiler environment variable
+      - name: Set CROSS_COMPILE environment variable
+        run: echo "CROSS_COMPILE=arm-linux-gnueabihf-" >> $GITHUB_ENV
+
+      # Build the kernel image
+      - name: Build Kernel Image
+        run: |
+          export CROSS_COMPILE=arm-linux-gnueabihf-
+          cd /tmp/aesd-autograder/linux
+          make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE defconfig
+          make ARCH=arm CROSS_COMPILE=$CROSS_COMPILE -j$(nproc) Image
+
+      # Build BusyBox
+      - name: Build BusyBox
+        run: |
+          cd /tmp/aesd-autograder/busybox
+          make CROSS_COMPILE=arm-linux-gnueabihf- defconfig
+          make CROSS_COMPILE=arm-linux-gnueabihf- -j$(nproc)
+
+      # Run the full test
+      - name: Run full test
+        run: ./full-test.sh
+
