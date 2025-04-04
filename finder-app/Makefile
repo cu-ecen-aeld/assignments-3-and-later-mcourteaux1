@@ -8,6 +8,9 @@ OBJ= writer.o
 writer: $(OBJ)
 	$(CC) -o $@ $^ $(CFLAGS)
 
+# ✅ This is what Buildroot calls during its build step
+all: writer
 
 clean:
 	rm -f *.o writer
+
