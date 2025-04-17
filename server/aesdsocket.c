@@ -1,192 +1,249 @@
+#include <arpa/inet.h>
+#include <asm-generic/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <fcntl.h>
-#include <signal.h>
+#include <sys/types.h>
 #include <syslog.h>
-#include <arpa/inet.h>
+#include <unistd.h>
 
-#define SERVER_PORT 9000
-#define MAX_CONNECTION_QUEUE 5
-#define BUFFER_LEN 1024
-#define DATA_FILE "/var/tmp/aesdsocketdata"
+#define BACKLOG 10
+#define PORT "9000"
+#define AESDFILE "/var/tmp/aesdsocketdata"
+#define BUFSIZE 1024
 
-// Global file descriptors for server and client sockets
-int server_socket_fd = -1;
-int client_socket_fd = -1;
+// globals for sig handling
+struct addrinfo hints;
+struct addrinfo *res;
 
-/**
- * @brief Signal handler for SIGINT and SIGTERM.
- *        Cleans up sockets, removes the file, logs messages, and exits.
- */
-void signal_handler(int signal_number) {
-    if (signal_number == SIGINT) {
-        printf("SIGINT received\n");
-    } else if (signal_number == SIGTERM) {
-        printf("SIGTERM received\n");
-    }
+int sockfd;
+int clientfd;
 
-    syslog(LOG_INFO, "Caught termination signal, exiting...");
-    syslog(LOG_INFO, "Closed connection on port %d", SERVER_PORT);
-    printf("Closed connection from port %d\n", SERVER_PORT);
+FILE *aesdfile;
 
-    if (client_socket_fd != -1) close(client_socket_fd);
-    if (server_socket_fd != -1) close(server_socket_fd);
+void sighandler(int signo) {
+  syslog(LOG_INFO, "Caught signal, exiting");
 
-    remove(DATA_FILE);  // Clean up the data file
-    closelog();
-    exit(EXIT_SUCCESS);
+  if (aesdfile != NULL) {
+    fclose(aesdfile);
+    remove(AESDFILE);
+  }
+
+  freeaddrinfo(res);
+  shutdown(clientfd, SHUT_RDWR);
+  shutdown(sockfd, SHUT_RDWR);
+
+  closelog();
+  exit(0);
 }
 
-int main(int argc, char *argv[]) {
-    int data_file_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_size = sizeof(client_addr);
-    char io_buffer[BUFFER_LEN];
-    ssize_t recv_bytes, read_bytes;
-
-    int run_as_daemon = 0;
-    if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        run_as_daemon = 1;
-    }
-
-    // Register signal handler
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    openlog("aesdsocket", LOG_PID, LOG_USER);
-
-    // Create a TCP socket
-    server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket_fd == -1) {
-        perror("Socket creation failed");
-        return EXIT_FAILURE;
-    }
-
-    // Set server address and port
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;  // Listen on all interfaces
-    server_addr.sin_port = htons(SERVER_PORT);
-
-    // Allow address reuse
-    int reuse_opt = 1;
-    if (setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_opt, sizeof(reuse_opt)) == -1) {
-        perror("setsockopt failed");
-        close(server_socket_fd);
-        return EXIT_FAILURE;
-    }
-
-    // Bind the socket to the port
-    if (bind(server_socket_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
-        perror("Bind failed");
-        close(server_socket_fd);
-        return EXIT_FAILURE;
-    }
-
-    // If daemon mode is requested, fork off and redirect stdio
-    if (run_as_daemon) {
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("Fork failed");
-            exit(EXIT_FAILURE);
-        } else if (pid > 0) {
-            // Parent process exits
-            exit(EXIT_SUCCESS);
-        }
-
-        // Child becomes session leader
-        if (setsid() == -1) {
-            perror("setsid failed");
-            exit(EXIT_FAILURE);
-        }
-
-        // Redirect stdin, stdout, stderr to /dev/null
-        int devnull_fd = open("/dev/null", O_RDWR);
-        if (devnull_fd != -1) {
-            dup2(devnull_fd, STDIN_FILENO);
-            dup2(devnull_fd, STDOUT_FILENO);
-            dup2(devnull_fd, STDERR_FILENO);
-            if (devnull_fd > 2) close(devnull_fd);
-        }
-    }
-
-    // Listen for incoming connections
-    if (listen(server_socket_fd, MAX_CONNECTION_QUEUE) == -1) {
-        perror("Listen failed");
-        close(server_socket_fd);
-        return EXIT_FAILURE;
-    }
-
-    printf("Server is listening on port %d...\n", SERVER_PORT);
-
-    // Main server loop
-    while (1) {
-        // Accept new connection
-        client_socket_fd = accept(server_socket_fd, (struct sockaddr*)&client_addr, &client_addr_size);
-        if (client_socket_fd == -1) {
-            perror("Accept failed");
-            continue;
-        }
-
-        char client_ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, INET_ADDRSTRLEN);
-        syslog(LOG_INFO, "Accepted connection from %s", client_ip_str);
-
-        // Open the file to append received data
-        data_file_fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (data_file_fd == -1) {
-            perror("File open for append failed");
-            close(client_socket_fd);
-            continue;
-        }
-
-        // Receive and write data until newline is found
-        while ((recv_bytes = recv(client_socket_fd, io_buffer, BUFFER_LEN - 1, 0)) > 0) {
-            io_buffer[recv_bytes] = '\0';  // Null-terminate buffer
-
-            if (write(data_file_fd, io_buffer, recv_bytes) == -1) {
-                perror("Write to file failed");
-                break;
-            }
-
-            if (strchr(io_buffer, '\n') != NULL) {
-                break;  // Stop reading after a complete line
-            }
-        }
-
-        if (recv_bytes == -1) {
-            perror("Receive failed");
-        }
-
-        close(data_file_fd);  // Close after writing
-
-        // Open file again for reading back contents
-        data_file_fd = open(DATA_FILE, O_RDONLY);
-        if (data_file_fd == -1) {
-            perror("File open for read failed");
-            close(client_socket_fd);
-            continue;
-        }
-
-        // Send file contents to the client
-        while ((read_bytes = read(data_file_fd, io_buffer, BUFFER_LEN)) > 0) {
-            if (send(client_socket_fd, io_buffer, read_bytes, 0) == -1) {
-                perror("Send failed");
-                break;
-            }
-        }
-
-        close(data_file_fd);
-        close(client_socket_fd);
-        printf("Closed connection with client\n");
-    }
-
-    // Cleanup (unreachable in this version)
-    close(server_socket_fd);
-    closelog();
-    return 0;
+void print_usage(void) {
+  printf("USAGE for aesdsocket\n");
+  printf("aesdsocket [-d]\n");
+  printf("OPTIONS:\n");
+  printf("\t-d: run aesdsocket as a daemon\n");
 }
 
+int main(int argc, char **argv) {
+
+  bool daemon;
+  if (argc == 2 && strncmp(argv[1], "-d", 2) == 0) {
+    daemon = true;
+  } else if (argc == 1) {
+    daemon = false;
+  } else {
+    print_usage();
+    return (-1);
+  }
+  struct sigaction sa = {
+    .sa_handler = sighandler,
+    // .sa_mask = {0},
+    // .sa_flags = 0
+  };
+  sigaction(SIGINT, &sa, NULL);
+  // avoid signal blocking issues
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGTERM, &sa, NULL);
+
+  openlog("aesdsocket", LOG_PID, LOG_USER);
+
+  // from beej's guide to sockets
+  // https://beej.us/guide/bgnet/html/split/system-calls-or-bust.html#system-calls-or-bust
+
+  memset(&hints, 0, sizeof hints);
+  // do not care if IPv4 or IPv6
+  hints.ai_family = AF_UNSPEC;
+  // TCP stream sockets
+  hints.ai_socktype = SOCK_STREAM;
+  // fill in my IP for me
+  hints.ai_flags = AI_PASSIVE;
+
+  int status;
+  if ((status = getaddrinfo(NULL, PORT, &hints, &res)) != 0) {
+    syslog(LOG_ERR, "Error getting addrinfo");
+    closelog();
+    return (-1);
+  }
+
+  sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (sockfd == -1) {
+    syslog(LOG_ERR, "Error on getting socket file descriptor");
+    freeaddrinfo(res);
+    closelog();
+    return (-1);
+  }
+
+  // get rid of "Adress already in use" error message
+  int yes = 1;
+  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1) {
+    syslog(LOG_ERR, "Error on setsockopt");
+    freeaddrinfo(res);
+    closelog();
+    close(sockfd);
+    return (-1);
+  }
+
+  if (bind(sockfd, res->ai_addr, res->ai_addrlen) == -1) {
+    syslog(LOG_ERR, "Error on binding socket");
+    freeaddrinfo(res);
+    closelog();
+    close(sockfd);
+    return (-1);
+  }
+
+  // fork here if in daemon mode
+  if (daemon) {
+    pid_t fork_pid = fork();
+    if (fork_pid == -1) {
+      syslog(LOG_ERR, "Error on creating fork");
+      freeaddrinfo(res);
+      closelog();
+      close(sockfd);
+      return (-1);
+    }
+
+    // parent process, end here
+    if (fork_pid != 0) {
+      syslog(LOG_INFO, "Exiting as fork for parent");
+      freeaddrinfo(res);
+      closelog();
+      close(sockfd);
+      return (0);
+    }
+
+    // if not the parent process, child process will take from here
+  }
+
+  if (listen(sockfd, BACKLOG) == -1) {
+    syslog(LOG_ERR, "Error on listen");
+    freeaddrinfo(res);
+    closelog();
+    close(sockfd);
+    return (-1);
+  }
+
+  // now can accept incoming connections
+
+  struct sockaddr_storage inc_addr;
+  socklen_t inc_addr_size = sizeof inc_addr;
+
+  // create file to read/write to
+  aesdfile = fopen(AESDFILE, "a+");
+  if (aesdfile == NULL) {
+    syslog(LOG_ERR, "Error on creating aesdfile");
+    freeaddrinfo(res);
+    closelog();
+    close(sockfd);
+    close(clientfd);
+    return (-1);
+  }
+
+  while (1) {
+    clientfd = accept(sockfd, (struct sockaddr *)&inc_addr, &inc_addr_size);
+    if (clientfd == -1) {
+      syslog(LOG_ERR, "Error on accepting client");
+      continue; // continue trying to accept clients;
+    }
+
+    // accepted a client, log the client IP
+    char ipstr[INET6_ADDRSTRLEN];
+    struct sockaddr_in *s = (struct sockaddr_in *)&inc_addr;
+    inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
+    syslog(LOG_INFO, "Accepted connection from %s", ipstr);
+
+    // receive messages
+    char *buf = malloc(sizeof(char) * BUFSIZE);
+    if (buf == NULL) {
+      syslog(LOG_ERR, "Error on mallocing buffer for reading");
+      freeaddrinfo(res);
+      closelog();
+      close(sockfd);
+      close(clientfd);
+      fclose(aesdfile);
+      remove(AESDFILE);
+      return (-1);
+    }
+
+    int read_bytes = 0;
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read_line_count;
+
+    while ((read_bytes = recv(clientfd, buf, BUFSIZE, 0)) > 0) {
+
+      char *newline_pos = (char *)memchr(buf, '\n', read_bytes);
+
+      // found a newline in the buffer, write to the file and then
+      // send file contents
+      if (newline_pos != NULL) {
+        // the +1 is there to include the newline character from the buffer
+        fwrite(buf, sizeof(char), newline_pos - buf + 1, aesdfile);
+        // fflush is here to force the file to be written and not stored
+        // in the kernel buffer
+        fflush(aesdfile);
+
+        rewind(aesdfile);
+        while ((read_line_count = getline(&line, &len, aesdfile)) != -1) {
+          send(clientfd, line, read_line_count, 0);
+        }
+        free(line);
+      } else {
+        // no newline character found, add whole buffer to file
+        fwrite(buf, sizeof(char), read_bytes, aesdfile);
+        fflush(aesdfile);
+      }
+    }
+
+    if (read_bytes == 0) {
+      syslog(LOG_INFO, "Closed connection from %s", ipstr);
+      free(buf);
+      buf = NULL;
+    }
+    if (read_bytes == -1) {
+      syslog(LOG_ERR, "Error on reading from recv");
+      free(buf);
+      freeaddrinfo(res);
+      shutdown(clientfd, SHUT_RDWR);
+      shutdown(sockfd, SHUT_RDWR);
+      fclose(aesdfile);
+      remove(AESDFILE);
+      return (-1);
+    }
+
+    if (buf != NULL) {
+      free(buf);
+    }
+  }
+
+  freeaddrinfo(res);
+  shutdown(clientfd, SHUT_RDWR);
+  shutdown(sockfd, SHUT_RDWR);
+  fclose(aesdfile);
+  remove(AESDFILE);
+  return (0);
+}

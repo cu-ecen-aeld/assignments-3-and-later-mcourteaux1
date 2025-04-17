@@ -1,12 +1,19 @@
-CC = gcc
-CFLAGS = -Wall -Werror -g
-TARGET = aesdsocket
+CROSS_COMPILE=
+CC=$(CROSS_COMPILE)gcc
+CFLAGS= -Wall -Werror
+DEPS=
 
-all: $(TARGET)
+SRCS=aesdsocket.c
+OBJS=$(SRCS:.c=.o)
 
-$(TARGET): aesdsocket.c
-	$(CC) $(CFLAGS) -o $(TARGET) aesdsocket.c
+# executable file
+MAIN=aesdsocket
+
+all: $(SRCS)
+	$(CC) $(CFLAGS) $^ -o $(MAIN)
+
+$(MAIN): $(SRCS)
+	$(CC) $(CFLAGS) $^ -o $@
 
 clean:
-	rm -f $(TARGET)
-
+	rm -f $(OBJS) $(MAIN)
