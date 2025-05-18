@@ -1,249 +1,167 @@
-#include <arpa/inet.h>
-#include <asm-generic/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <syslog.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/queue.h>
+#include <pthread.h>
+#include <time.h>
 
+#define PORT 9000
 #define BACKLOG 10
-#define PORT "9000"
-#define AESDFILE "/var/tmp/aesdsocketdata"
-#define BUFSIZE 1024
+#define FILE_PATH "/var/tmp/aesdsocketdata"
 
-// globals for sig handling
-struct addrinfo hints;
-struct addrinfo *res;
+volatile sig_atomic_t exit_requested = 0;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-int sockfd;
-int clientfd;
-
-FILE *aesdfile;
-
-void sighandler(int signo) {
-  syslog(LOG_INFO, "Caught signal, exiting");
-
-  if (aesdfile != NULL) {
-    fclose(aesdfile);
-    remove(AESDFILE);
-  }
-
-  freeaddrinfo(res);
-  shutdown(clientfd, SHUT_RDWR);
-  shutdown(sockfd, SHUT_RDWR);
-
-  closelog();
-  exit(0);
+void handle_signal(int sig) {
+    exit_requested = 1;
 }
 
-void print_usage(void) {
-  printf("USAGE for aesdsocket\n");
-  printf("aesdsocket [-d]\n");
-  printf("OPTIONS:\n");
-  printf("\t-d: run aesdsocket as a daemon\n");
+typedef struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr client_addr;
+    socklen_t client_addr_len;
+
+    SLIST_ENTRY(thread_data) entries;
+} thread_data_t;
+
+SLIST_HEAD(thread_list_head, thread_data);
+struct thread_list_head active_threads;
+
+void* handle_connection(void* arg) {
+    thread_data_t* td = (thread_data_t*)arg;
+    char buffer[1024];
+    ssize_t rcv_len;
+
+    FILE* fp = fopen(FILE_PATH, "a+");
+    if (!fp) {
+        perror("fopen");
+        close(td->client_fd);
+        free(td);
+        return NULL;
+    }
+
+    while ((rcv_len = recv(td->client_fd, buffer, sizeof(buffer), 0)) > 0) {
+        pthread_mutex_lock(&file_mutex);
+        fwrite(buffer, 1, rcv_len, fp);
+        fflush(fp);
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    fclose(fp);
+    close(td->client_fd);
+    return NULL;
 }
 
-int main(int argc, char **argv) {
+void* timestamp_thread_func(void* arg) {
+    while (!exit_requested) {
+        sleep(10);
 
-  bool daemon;
-  if (argc == 2 && strncmp(argv[1], "-d", 2) == 0) {
-    daemon = true;
-  } else if (argc == 1) {
-    daemon = false;
-  } else {
-    print_usage();
-    return (-1);
-  }
-  struct sigaction sa = {
-    .sa_handler = sighandler,
-    // .sa_mask = {0},
-    // .sa_flags = 0
-  };
-  sigaction(SIGINT, &sa, NULL);
-  // avoid signal blocking issues
-  sigemptyset(&sa.sa_mask);
-  sigaction(SIGTERM, &sa, NULL);
+        time_t now = time(NULL);
+        struct tm* tm_info = localtime(&now);
 
-  openlog("aesdsocket", LOG_PID, LOG_USER);
+        char timestamp[100];
+        strftime(timestamp, sizeof(timestamp), "timestamp: %a, %d %b %Y %H:%M:%S %z\n", tm_info);
 
-  // from beej's guide to sockets
-  // https://beej.us/guide/bgnet/html/split/system-calls-or-bust.html#system-calls-or-bust
-
-  memset(&hints, 0, sizeof hints);
-  // do not care if IPv4 or IPv6
-  hints.ai_family = AF_UNSPEC;
-  // TCP stream sockets
-  hints.ai_socktype = SOCK_STREAM;
-  // fill in my IP for me
-  hints.ai_flags = AI_PASSIVE;
-
-  int status;
-  if ((status = getaddrinfo(NULL, PORT, &hints, &res)) != 0) {
-    syslog(LOG_ERR, "Error getting addrinfo");
-    closelog();
-    return (-1);
-  }
-
-  sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (sockfd == -1) {
-    syslog(LOG_ERR, "Error on getting socket file descriptor");
-    freeaddrinfo(res);
-    closelog();
-    return (-1);
-  }
-
-  // get rid of "Adress already in use" error message
-  int yes = 1;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1) {
-    syslog(LOG_ERR, "Error on setsockopt");
-    freeaddrinfo(res);
-    closelog();
-    close(sockfd);
-    return (-1);
-  }
-
-  if (bind(sockfd, res->ai_addr, res->ai_addrlen) == -1) {
-    syslog(LOG_ERR, "Error on binding socket");
-    freeaddrinfo(res);
-    closelog();
-    close(sockfd);
-    return (-1);
-  }
-
-  // fork here if in daemon mode
-  if (daemon) {
-    pid_t fork_pid = fork();
-    if (fork_pid == -1) {
-      syslog(LOG_ERR, "Error on creating fork");
-      freeaddrinfo(res);
-      closelog();
-      close(sockfd);
-      return (-1);
-    }
-
-    // parent process, end here
-    if (fork_pid != 0) {
-      syslog(LOG_INFO, "Exiting as fork for parent");
-      freeaddrinfo(res);
-      closelog();
-      close(sockfd);
-      return (0);
-    }
-
-    // if not the parent process, child process will take from here
-  }
-
-  if (listen(sockfd, BACKLOG) == -1) {
-    syslog(LOG_ERR, "Error on listen");
-    freeaddrinfo(res);
-    closelog();
-    close(sockfd);
-    return (-1);
-  }
-
-  // now can accept incoming connections
-
-  struct sockaddr_storage inc_addr;
-  socklen_t inc_addr_size = sizeof inc_addr;
-
-  // create file to read/write to
-  aesdfile = fopen(AESDFILE, "a+");
-  if (aesdfile == NULL) {
-    syslog(LOG_ERR, "Error on creating aesdfile");
-    freeaddrinfo(res);
-    closelog();
-    close(sockfd);
-    close(clientfd);
-    return (-1);
-  }
-
-  while (1) {
-    clientfd = accept(sockfd, (struct sockaddr *)&inc_addr, &inc_addr_size);
-    if (clientfd == -1) {
-      syslog(LOG_ERR, "Error on accepting client");
-      continue; // continue trying to accept clients;
-    }
-
-    // accepted a client, log the client IP
-    char ipstr[INET6_ADDRSTRLEN];
-    struct sockaddr_in *s = (struct sockaddr_in *)&inc_addr;
-    inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof ipstr);
-    syslog(LOG_INFO, "Accepted connection from %s", ipstr);
-
-    // receive messages
-    char *buf = malloc(sizeof(char) * BUFSIZE);
-    if (buf == NULL) {
-      syslog(LOG_ERR, "Error on mallocing buffer for reading");
-      freeaddrinfo(res);
-      closelog();
-      close(sockfd);
-      close(clientfd);
-      fclose(aesdfile);
-      remove(AESDFILE);
-      return (-1);
-    }
-
-    int read_bytes = 0;
-    char *line = NULL;
-    size_t len = 0;
-    ssize_t read_line_count;
-
-    while ((read_bytes = recv(clientfd, buf, BUFSIZE, 0)) > 0) {
-
-      char *newline_pos = (char *)memchr(buf, '\n', read_bytes);
-
-      // found a newline in the buffer, write to the file and then
-      // send file contents
-      if (newline_pos != NULL) {
-        // the +1 is there to include the newline character from the buffer
-        fwrite(buf, sizeof(char), newline_pos - buf + 1, aesdfile);
-        // fflush is here to force the file to be written and not stored
-        // in the kernel buffer
-        fflush(aesdfile);
-
-        rewind(aesdfile);
-        while ((read_line_count = getline(&line, &len, aesdfile)) != -1) {
-          send(clientfd, line, read_line_count, 0);
+        pthread_mutex_lock(&file_mutex);
+        FILE* fp = fopen(FILE_PATH, "a");
+        if (fp) {
+            fputs(timestamp, fp);
+            fclose(fp);
         }
-        free(line);
-      } else {
-        // no newline character found, add whole buffer to file
-        fwrite(buf, sizeof(char), read_bytes, aesdfile);
-        fflush(aesdfile);
-      }
+        pthread_mutex_unlock(&file_mutex);
     }
-
-    if (read_bytes == 0) {
-      syslog(LOG_INFO, "Closed connection from %s", ipstr);
-      free(buf);
-      buf = NULL;
-    }
-    if (read_bytes == -1) {
-      syslog(LOG_ERR, "Error on reading from recv");
-      free(buf);
-      freeaddrinfo(res);
-      shutdown(clientfd, SHUT_RDWR);
-      shutdown(sockfd, SHUT_RDWR);
-      fclose(aesdfile);
-      remove(AESDFILE);
-      return (-1);
-    }
-
-    if (buf != NULL) {
-      free(buf);
-    }
-  }
-
-  freeaddrinfo(res);
-  shutdown(clientfd, SHUT_RDWR);
-  shutdown(sockfd, SHUT_RDWR);
-  fclose(aesdfile);
-  remove(AESDFILE);
-  return (0);
+    return NULL;
 }
+
+int main() {
+    int server_fd;
+    struct sockaddr_in server_addr;
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    SLIST_INIT(&active_threads);
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("bind");
+        close(server_fd);
+        return 1;
+    }
+
+    if (listen(server_fd, BACKLOG) == -1) {
+        perror("listen");
+        close(server_fd);
+        return 1;
+    }
+
+    pthread_t timer_thread;
+    if (pthread_create(&timer_thread, NULL, timestamp_thread_func, NULL) != 0) {
+        perror("pthread_create (timestamp)");
+        close(server_fd);
+        return 1;
+    }
+
+    while (!exit_requested) {
+        thread_data_t* td = malloc(sizeof(thread_data_t));
+        if (!td) {
+            perror("malloc");
+            continue;
+        }
+
+        td->client_addr_len = sizeof(td->client_addr);
+        td->client_fd = accept(server_fd, (struct sockaddr*)&td->client_addr, &td->client_addr_len);
+
+        if (td->client_fd == -1) {
+            free(td);
+            if (exit_requested) break;
+            perror("accept");
+            continue;
+        }
+
+        if (pthread_create(&td->thread_id, NULL, handle_connection, td) != 0) {
+            perror("pthread_create");
+            close(td->client_fd);
+            free(td);
+            continue;
+        }
+
+        SLIST_INSERT_HEAD(&active_threads, td, entries);
+    }
+
+    // Shutdown cleanup
+    close(server_fd);
+    pthread_join(timer_thread, NULL);
+
+    thread_data_t* td;
+    while (!SLIST_EMPTY(&active_threads)) {
+        td = SLIST_FIRST(&active_threads);
+        pthread_join(td->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&active_threads, entries);
+        free(td);
+    }
+
+    pthread_mutex_destroy(&file_mutex);
+    remove(FILE_PATH);
+
+    return 0;
+}
+
