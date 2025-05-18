@@ -11,154 +11,173 @@
 #include <sys/queue.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #define PORT 9000
 #define BACKLOG 10
 #define FILE_PATH "/var/tmp/aesdsocketdata"
+#define TIMESTAMP_INTERVAL 10
 
-volatile sig_atomic_t exit_requested = 0;
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-void handle_signal(int sig) {
-    exit_requested = 1;
-}
-
+// Thread data structure
 typedef struct thread_data {
     pthread_t thread_id;
     int client_fd;
-    struct sockaddr client_addr;
-    socklen_t client_addr_len;
     SLIST_ENTRY(thread_data) entries;
 } thread_data_t;
 
 SLIST_HEAD(thread_list_head, thread_data);
-struct thread_list_head active_threads;
+struct thread_list_head active_threads = SLIST_HEAD_INITIALIZER(active_threads);
 
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+volatile sig_atomic_t exit_requested = 0;
+timer_t timerid;
+
+// Signal handler
+void handle_signal(int sig) {
+    exit_requested = 1;
+}
+
+// Timestamp writer
+void write_timestamp(void) {
+    time_t now = time(NULL);
+    struct tm* tm_info = localtime(&now);
+    char timestamp[100];
+
+    strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
+
+    pthread_mutex_lock(&file_mutex);
+    int fd = open(FILE_PATH, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd != -1) {
+        write(fd, timestamp, strlen(timestamp));
+        close(fd);
+    }
+    pthread_mutex_unlock(&file_mutex);
+}
+
+// Timer signal handler
+void timer_thread_handler(union sigval val) {
+    write_timestamp();
+}
+
+// Per-connection thread function
 void* handle_connection(void* arg) {
     thread_data_t* td = (thread_data_t*)arg;
-    char buffer[1024] = {0};
-    ssize_t rcv_len = 0;
-    size_t total_len = 0;
+    char buffer[1024];
+    ssize_t bytes_read = 0;
 
-    FILE* fp = fopen(FILE_PATH, "a+");
-    if (!fp) {
-        perror("fopen");
+    // Receive until newline
+    size_t total = 0;
+    memset(buffer, 0, sizeof(buffer));
+    while ((bytes_read = recv(td->client_fd, buffer + total, sizeof(buffer) - total, 0)) > 0) {
+        total += bytes_read;
+        if (memchr(buffer, '\n', total)) break;
+    }
+
+    if (bytes_read < 0) {
+        perror("recv");
         close(td->client_fd);
         free(td);
         return NULL;
     }
 
-    // Receive data until newline
-    while ((rcv_len = recv(td->client_fd, buffer + total_len, sizeof(buffer) - total_len, 0)) > 0) {
-        total_len += rcv_len;
-        if (memchr(buffer, '\n', total_len)) {
-            break;
-        }
-    }
-
-    if (rcv_len == -1) {
-        perror("recv");
-    }
-
-    // Write to file under mutex
     pthread_mutex_lock(&file_mutex);
-    fwrite(buffer, 1, total_len, fp);
-    fflush(fp);
+    int fd = open(FILE_PATH, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd >= 0) {
+        write(fd, buffer, total);
+        close(fd);
+    }
+
+    // Send file content back
+    fd = open(FILE_PATH, O_RDONLY);
+    if (fd >= 0) {
+        while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+            send(td->client_fd, buffer, bytes_read, 0);
+        }
+        close(fd);
+    }
     pthread_mutex_unlock(&file_mutex);
 
-    // Echo entire file back to client
-    fseek(fp, 0, SEEK_SET);
-    char read_buf[1024];
-    while (fgets(read_buf, sizeof(read_buf), fp) != NULL) {
-        send(td->client_fd, read_buf, strlen(read_buf), 0);
-    }
-
-    fclose(fp);
     close(td->client_fd);
     free(td);
     return NULL;
 }
 
-void* timestamp_thread_func(void* arg) {
-    while (!exit_requested) {
-        sleep(10);
-
-        time_t now = time(NULL);
-        struct tm* tm_info = localtime(&now);
-
-        char timestamp[100];
-        strftime(timestamp, sizeof(timestamp), "timestamp: %a, %d %b %Y %H:%M:%S %z\n", tm_info);
-
-        pthread_mutex_lock(&file_mutex);
-        FILE* fp = fopen(FILE_PATH, "a");
-        if (fp) {
-            fputs(timestamp, fp);
-            fclose(fp);
-        }
-        pthread_mutex_unlock(&file_mutex);
-    }
-    return NULL;
-}
-
 int main() {
-    int server_fd;
+    int sockfd;
     struct sockaddr_in server_addr;
+    struct sigevent sev;
+    struct itimerspec its;
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    SLIST_INIT(&active_threads);
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
+    // Init socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
         perror("socket");
         return 1;
     }
+
+    int enable = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+    if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
-        close(server_fd);
+        close(sockfd);
         return 1;
     }
 
-    if (listen(server_fd, BACKLOG) == -1) {
+    if (listen(sockfd, BACKLOG) < 0) {
         perror("listen");
-        close(server_fd);
+        close(sockfd);
         return 1;
     }
 
-    pthread_t timer_thread;
-    if (pthread_create(&timer_thread, NULL, timestamp_thread_func, NULL) != 0) {
-        perror("pthread_create (timestamp)");
-        close(server_fd);
+    // Setup timer
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = timer_thread_handler;
+
+    if (timer_create(CLOCK_REALTIME, &sev, &timerid) < 0) {
+        perror("timer_create");
+        close(sockfd);
         return 1;
     }
 
+    its.it_value.tv_sec = TIMESTAMP_INTERVAL;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = TIMESTAMP_INTERVAL;
+    its.it_interval.tv_nsec = 0;
+    timer_settime(timerid, 0, &its, NULL);
+
+    // Accept loop
     while (!exit_requested) {
-        thread_data_t* td = malloc(sizeof(thread_data_t));
-        if (!td) {
-            perror("malloc");
-            continue;
-        }
-
-        td->client_addr_len = sizeof(td->client_addr);
-        td->client_fd = accept(server_fd, (struct sockaddr*)&td->client_addr, &td->client_addr_len);
-
-        if (td->client_fd == -1) {
-            free(td);
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+        int client_fd = accept(sockfd, (struct sockaddr*)&client_addr, &addrlen);
+        if (client_fd < 0) {
             if (exit_requested) break;
             perror("accept");
             continue;
         }
 
+        thread_data_t* td = malloc(sizeof(thread_data_t));
+        if (!td) {
+            perror("malloc");
+            close(client_fd);
+            continue;
+        }
+
+        td->client_fd = client_fd;
+
         if (pthread_create(&td->thread_id, NULL, handle_connection, td) != 0) {
             perror("pthread_create");
-            close(td->client_fd);
+            close(client_fd);
             free(td);
             continue;
         }
@@ -166,9 +185,11 @@ int main() {
         SLIST_INSERT_HEAD(&active_threads, td, entries);
     }
 
-    close(server_fd);
-    pthread_join(timer_thread, NULL);
+    // Cleanup
+    timer_delete(timerid);
+    close(sockfd);
 
+    // Join all threads
     thread_data_t* td;
     while (!SLIST_EMPTY(&active_threads)) {
         td = SLIST_FIRST(&active_threads);
@@ -179,7 +200,6 @@ int main() {
 
     pthread_mutex_destroy(&file_mutex);
     remove(FILE_PATH);
-
     return 0;
 }
 
