@@ -28,7 +28,6 @@ typedef struct thread_data {
     int client_fd;
     struct sockaddr client_addr;
     socklen_t client_addr_len;
-
     SLIST_ENTRY(thread_data) entries;
 } thread_data_t;
 
@@ -37,8 +36,9 @@ struct thread_list_head active_threads;
 
 void* handle_connection(void* arg) {
     thread_data_t* td = (thread_data_t*)arg;
-    char buffer[1024];
-    ssize_t rcv_len;
+    char buffer[1024] = {0};
+    ssize_t rcv_len = 0;
+    size_t total_len = 0;
 
     FILE* fp = fopen(FILE_PATH, "a+");
     if (!fp) {
@@ -48,15 +48,34 @@ void* handle_connection(void* arg) {
         return NULL;
     }
 
-    while ((rcv_len = recv(td->client_fd, buffer, sizeof(buffer), 0)) > 0) {
-        pthread_mutex_lock(&file_mutex);
-        fwrite(buffer, 1, rcv_len, fp);
-        fflush(fp);
-        pthread_mutex_unlock(&file_mutex);
+    // Receive data until newline
+    while ((rcv_len = recv(td->client_fd, buffer + total_len, sizeof(buffer) - total_len, 0)) > 0) {
+        total_len += rcv_len;
+        if (memchr(buffer, '\n', total_len)) {
+            break;
+        }
+    }
+
+    if (rcv_len == -1) {
+        perror("recv");
+    }
+
+    // Write to file under mutex
+    pthread_mutex_lock(&file_mutex);
+    fwrite(buffer, 1, total_len, fp);
+    fflush(fp);
+    pthread_mutex_unlock(&file_mutex);
+
+    // Echo entire file back to client
+    fseek(fp, 0, SEEK_SET);
+    char read_buf[1024];
+    while (fgets(read_buf, sizeof(read_buf), fp) != NULL) {
+        send(td->client_fd, read_buf, strlen(read_buf), 0);
     }
 
     fclose(fp);
     close(td->client_fd);
+    free(td);
     return NULL;
 }
 
@@ -147,7 +166,6 @@ int main() {
         SLIST_INSERT_HEAD(&active_threads, td, entries);
     }
 
-    // Shutdown cleanup
     close(server_fd);
     pthread_join(timer_thread, NULL);
 
