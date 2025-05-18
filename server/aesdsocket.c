@@ -3,46 +3,39 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <signal.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/queue.h>
 #include <pthread.h>
+#include <signal.h>
 #include <time.h>
-#include <sys/stat.h>
+#include <sys/queue.h>
 
 #define PORT 9000
 #define BACKLOG 10
 #define FILE_PATH "/var/tmp/aesdsocketdata"
 #define TIMESTAMP_INTERVAL 10
 
-// Thread data structure
-typedef struct thread_data {
+typedef struct thread_entry {
     pthread_t thread_id;
     int client_fd;
-    SLIST_ENTRY(thread_data) entries;
-} thread_data_t;
+    SLIST_ENTRY(thread_entry) entries;
+} thread_entry_t;
 
-SLIST_HEAD(thread_list_head, thread_data);
-struct thread_list_head active_threads = SLIST_HEAD_INITIALIZER(active_threads);
-
+SLIST_HEAD(thread_list_head, thread_entry) active_threads = SLIST_HEAD_INITIALIZER(active_threads);
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 volatile sig_atomic_t exit_requested = 0;
 timer_t timerid;
 
-// Signal handler
 void handle_signal(int sig) {
     exit_requested = 1;
 }
 
-// Timestamp writer
 void write_timestamp(void) {
     time_t now = time(NULL);
     struct tm* tm_info = localtime(&now);
-    char timestamp[100];
-
+    char timestamp[128];
     strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
 
     pthread_mutex_lock(&file_mutex);
@@ -54,51 +47,40 @@ void write_timestamp(void) {
     pthread_mutex_unlock(&file_mutex);
 }
 
-// Timer signal handler
 void timer_thread_handler(union sigval val) {
     write_timestamp();
 }
 
-// Per-connection thread function
 void* handle_connection(void* arg) {
-    thread_data_t* td = (thread_data_t*)arg;
-    char buffer[1024];
-    ssize_t bytes_read = 0;
-
-    // Receive until newline
+    thread_entry_t* entry = (thread_entry_t*)arg;
+    char buffer[4096];
+    ssize_t bytes_read;
     size_t total = 0;
     memset(buffer, 0, sizeof(buffer));
-    while ((bytes_read = recv(td->client_fd, buffer + total, sizeof(buffer) - total, 0)) > 0) {
+
+    while ((bytes_read = recv(entry->client_fd, buffer + total, sizeof(buffer) - total, 0)) > 0) {
         total += bytes_read;
         if (memchr(buffer, '\n', total)) break;
     }
 
-    if (bytes_read < 0) {
-        perror("recv");
-        close(td->client_fd);
-        free(td);
-        return NULL;
-    }
-
     pthread_mutex_lock(&file_mutex);
     int fd = open(FILE_PATH, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd >= 0) {
+    if (fd != -1) {
         write(fd, buffer, total);
         close(fd);
     }
 
-    // Send file content back
     fd = open(FILE_PATH, O_RDONLY);
-    if (fd >= 0) {
+    if (fd != -1) {
         while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
-            send(td->client_fd, buffer, bytes_read, 0);
+            send(entry->client_fd, buffer, bytes_read, 0);
         }
         close(fd);
     }
     pthread_mutex_unlock(&file_mutex);
 
-    close(td->client_fd);
-    free(td);
+    close(entry->client_fd);
+    free(entry);
     return NULL;
 }
 
@@ -107,20 +89,29 @@ int main() {
     struct sockaddr_in server_addr;
     struct sigevent sev;
     struct itimerspec its;
+    int timer_started = 0;
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    struct sigaction sa = {0};
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    // Init socket
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("socket");
-        return 1;
+    // Conditional daemonization
+    if (getppid() != 1) {
+        pid_t pid = fork();
+        if (pid < 0) exit(EXIT_FAILURE);
+        if (pid > 0) exit(0);
+        if (setsid() < 0) exit(EXIT_FAILURE);
     }
 
-    int enable = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+    // Truncate the file on start
+    int trunc_fd = open(FILE_PATH, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+    if (trunc_fd != -1) close(trunc_fd);
 
+    // Create socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
@@ -129,77 +120,61 @@ int main() {
     if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
         close(sockfd);
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
     if (listen(sockfd, BACKLOG) < 0) {
         perror("listen");
         close(sockfd);
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
-    // Setup timer
-    memset(&sev, 0, sizeof(sev));
-    sev.sigev_notify = SIGEV_THREAD;
-    sev.sigev_notify_function = timer_thread_handler;
-
-    if (timer_create(CLOCK_REALTIME, &sev, &timerid) < 0) {
-        perror("timer_create");
-        close(sockfd);
-        return 1;
-    }
-
-    its.it_value.tv_sec = TIMESTAMP_INTERVAL;
-    its.it_value.tv_nsec = 0;
-    its.it_interval.tv_sec = TIMESTAMP_INTERVAL;
-    its.it_interval.tv_nsec = 0;
-    timer_settime(timerid, 0, &its, NULL);
-
-    // Accept loop
     while (!exit_requested) {
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
         int client_fd = accept(sockfd, (struct sockaddr*)&client_addr, &addrlen);
         if (client_fd < 0) {
             if (exit_requested) break;
-            perror("accept");
             continue;
         }
 
-        thread_data_t* td = malloc(sizeof(thread_data_t));
-        if (!td) {
-            perror("malloc");
+        if (!timer_started) {
+            memset(&sev, 0, sizeof(sev));
+            sev.sigev_notify = SIGEV_THREAD;
+            sev.sigev_notify_function = timer_thread_handler;
+            if (timer_create(CLOCK_REALTIME, &sev, &timerid) == 0) {
+                its.it_value.tv_sec = TIMESTAMP_INTERVAL;
+                its.it_value.tv_nsec = 0;
+                its.it_interval.tv_sec = TIMESTAMP_INTERVAL;
+                its.it_interval.tv_nsec = 0;
+                timer_settime(timerid, 0, &its, NULL);
+                timer_started = 1;
+            }
+        }
+
+        thread_entry_t* entry = malloc(sizeof(thread_entry_t));
+        if (!entry) {
             close(client_fd);
             continue;
         }
 
-        td->client_fd = client_fd;
-
-        if (pthread_create(&td->thread_id, NULL, handle_connection, td) != 0) {
-            perror("pthread_create");
-            close(client_fd);
-            free(td);
-            continue;
-        }
-
-        SLIST_INSERT_HEAD(&active_threads, td, entries);
+        entry->client_fd = client_fd;
+        pthread_create(&entry->thread_id, NULL, handle_connection, entry);
+        SLIST_INSERT_HEAD(&active_threads, entry, entries);
     }
 
-    // Cleanup
-    timer_delete(timerid);
+    if (timer_started) timer_delete(timerid);
     close(sockfd);
 
-    // Join all threads
-    thread_data_t* td;
+    thread_entry_t* entry;
     while (!SLIST_EMPTY(&active_threads)) {
-        td = SLIST_FIRST(&active_threads);
-        pthread_join(td->thread_id, NULL);
+        entry = SLIST_FIRST(&active_threads);
+        pthread_join(entry->thread_id, NULL);
         SLIST_REMOVE_HEAD(&active_threads, entries);
-        free(td);
+        free(entry);
     }
 
     pthread_mutex_destroy(&file_mutex);
     remove(FILE_PATH);
     return 0;
 }
-
